@@ -42,7 +42,7 @@ public class PerformanceService {
             // 经手牙位的返工：该技工做过工序的牙位上发生的返工（按牙位去重）
             Set<Long> itemIds = stages.stream().map(s -> s.getToothItem().getId()).collect(Collectors.toSet());
             long reworkItems = itemIds.stream()
-                    .filter(id -> !reworkRepo.findByToothItemIdAndStatus(id, ReworkStatus.OPEN).isEmpty()
+                    .filter(id -> !reworkRepo.findByToothItemIdAndStatusNot(id, ReworkStatus.COMPLETED).isEmpty()
                             || reworkTouched(id))
                     .count();
 

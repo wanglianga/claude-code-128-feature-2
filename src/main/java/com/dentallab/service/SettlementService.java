@@ -53,9 +53,10 @@ public class SettlementService {
             throw new BizException("订单已生成结算单，不能重复生成");
         }
         List<ReworkRecord> reworks = reworkRepo.findByOrderIdOrderByIdAsc(orderId);
-        long pending = reworks.stream().filter(r -> r.getResponsibility() == Responsibility.PENDING).count();
-        if (pending > 0) {
-            throw new BizException("存在 " + pending + " 条返工责任未判定（返工责任不清），请先判定责任再结算");
+        long unresolved = reworks.stream().filter(r -> r.getResponsibility() == null).count();
+        if (unresolved > 0) {
+            throw new BizException("存在 " + unresolved + " 条试戴返工未经诊所确认（返工时限/责任/是否收费未落定），"
+                    + "请先提交返工方案并由诊所确认再结算");
         }
 
         int toothCount = itemRepo.findByOrderIdOrderByIdAsc(orderId).size();

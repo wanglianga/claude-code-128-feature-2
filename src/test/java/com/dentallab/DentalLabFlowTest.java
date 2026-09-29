@@ -19,7 +19,9 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * 端到端流程测试（真实 PostgreSQL，dentallab_test 库）：
- * 下单→接单→八道工序→发货→签收→试戴→返工→责任判定→重做→再签收→结算→月结复核。
+ * 下单→接单→八道工序→发货→签收→试戴（密合/边缘不密合/咬合高）→
+ * 返工方案（时限/责任/收费）→诊所驳回→修订→确认→标记原因(设计/加工/取模)→重做→
+ * 再签收→结算→技工所同步月结→月结争议→处理→诊所确认→财务确认。
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -58,6 +60,7 @@ class DentalLabFlowTest {
     private static Long reworkId;
     private static Long zirconiaBatchId;
     private static Long statementId;
+    private static Long disputeId;
 
     // ---------- 主流程 ----------
 
@@ -81,6 +84,11 @@ class DentalLabFlowTest {
         // 无令牌访问受保护接口应 401
         ResponseEntity<Map> noAuth = plain.getForEntity(url("/api/orders"), Map.class);
         assertEquals(HttpStatus.UNAUTHORIZED, noAuth.getStatusCode());
+        // OpenAPI 文档与 Swagger UI 可匿名访问
+        assertEquals(HttpStatus.OK,
+                plain.getForEntity(url("/v3/api-docs"), Map.class).getStatusCode());
+        assertEquals(HttpStatus.OK,
+                plain.getForEntity(url("/swagger-ui/index.html"), String.class).getStatusCode());
     }
 
     @Test
@@ -112,7 +120,7 @@ class DentalLabFlowTest {
                         "sizeBytes", 2048576, "storagePath", "oss://scans/pat0001_upper.stl")));
         assertEquals("STL", scan.get("format"));
 
-        // 诊所医生不能给别的角色下单权限之外的操作：技工角色不能下单
+        // 技工角色不能下单
         ResponseEntity<Map> forbidden = postRaw(tech1Token, "/api/orders", body);
         assertEquals(HttpStatus.FORBIDDEN, forbidden.getStatusCode());
     }
@@ -131,8 +139,9 @@ class DentalLabFlowTest {
             // 模型接收（前台）
             data(post(receiverToken, "/api/orders/" + orderId + "/items/" + item + "/stages",
                     stageBody("MODEL_RECEIVING", "收到口扫数据与模型", null, null, null)));
-            // 扫描设计（技工1），写设计摘要
-            Map<String, Object> design = stageBody("SCAN_DESIGN", "设计完成", null, null, null);
+            // 扫描设计（技工1），写设计摘要与设计文件 → 生成设计版本 v1
+            Map<String, Object> design = stageBody("SCAN_DESIGN", "设计完成", null, null,
+                    List.of("design_v1_" + item + ".stl"));
             design.put("designSummary", "全瓷冠设计，边缘位于龈上0.5mm");
             data(post(tech1Token, "/api/orders/" + orderId + "/items/" + item + "/stages", design));
         }
@@ -188,6 +197,10 @@ class DentalLabFlowTest {
 
         Map<String, Object> detail = data(get(doctorToken, "/api/orders/" + orderId));
         assertEquals("QC_PASSED", detail.get("status"));
+        // 每颗牙生成设计版本 v1
+        List<Map<String, Object>> versions = list(detail, "designVersions");
+        assertEquals(2, versions.size());
+        assertEquals(1, versions.get(0).get("versionNo"));
     }
 
     @Test
@@ -213,36 +226,93 @@ class DentalLabFlowTest {
         fit.put("experienceScore", 5);
         data(post(doctorToken, "/api/orders/" + orderId + "/try-ins", fit));
 
-        // 牙位 12 试戴不密合 → 自动异常 + 自动返工
+        // 不密合但未说明问题类型应被拒绝
+        Map<String, Object> missingIssue = new HashMap<>();
+        missingIssue.put("toothItemId", item2);
+        missingIssue.put("result", "MISFIT");
+        missingIssue.put("feedback", "不舒服");
+        ResponseEntity<Map> bad = postRaw(doctorToken, "/api/orders/" + orderId + "/try-ins", missingIssue);
+        assertEquals(HttpStatus.BAD_REQUEST, bad.getStatusCode());
+
+        // 牙位 12 试戴边缘不密合，附医生备注与试戴照片 → 自动异常 + 自动返工（待方案）
         Map<String, Object> misfit = new HashMap<>();
         misfit.put("toothItemId", item2);
         misfit.put("result", "MISFIT");
+        misfit.put("issueType", "EDGE_GAP");
         misfit.put("feedback", "边缘不密合，食物嵌塞");
+        misfit.put("photos", List.of("tryin_12_1.jpg", "tryin_12_2.jpg"));
         misfit.put("experienceScore", 2);
-        data(post(doctorToken, "/api/orders/" + orderId + "/try-ins", misfit));
+        Map<String, Object> misfitRecord = data(post(doctorToken, "/api/orders/" + orderId + "/try-ins", misfit));
+        assertEquals("EDGE_GAP", misfitRecord.get("issueType"));
+        assertNotNull(misfitRecord.get("reworkId"));
 
         Map<String, Object> after = data(get(doctorToken, "/api/orders/" + orderId));
         List<Map<String, Object>> exceptions = list(after, "exceptions");
         assertTrue(exceptions.stream().anyMatch(e -> "TRY_IN_MISFIT".equals(e.get("type"))));
         List<Map<String, Object>> reworks = list(after, "reworks");
         assertEquals(1, reworks.size());
-        assertEquals("PENDING", reworks.get(0).get("responsibility"));
-        reworkId = toLong(reworks.get(0).get("id"));
+        Map<String, Object> rework = reworks.get(0);
+        reworkId = toLong(rework.get("id"));
+        // 新返工单：待技工所提交方案；关联设计版本 v1、医生备注、试戴照片
+        assertEquals("AWAITING_PLAN", rework.get("status"));
+        assertEquals("EDGE_GAP", rework.get("issueType"));
+        assertNull(rework.get("responsibility"));
+        assertNotNull(rework.get("designVersionId"));
+        assertEquals(1, rework.get("designVersionNo"));
+        assertNotNull(rework.get("tryInPhotos"));
+        assertTrue(String.valueOf(rework.get("tryInPhotos")).contains("tryin_12_1.jpg"));
+
+        // 返工方案未经诊所确认前，牙位不能开始重做
+        ResponseEntity<Map> blockedStage = postRaw(receiverToken,
+                "/api/orders/" + orderId + "/items/" + item2 + "/stages",
+                stageBody("MODEL_RECEIVING", "试图先返工", null, null, null));
+        assertEquals(HttpStatus.BAD_REQUEST, blockedStage.getStatusCode());
     }
 
     @Test
     @Order(5)
-    void reworkResponsibilityAndRedo() {
-        // 客服上报“返工责任不清”异常
-        data(post(serviceToken, "/api/orders/" + orderId + "/exceptions",
-                Map.of("type", "REWORK_DISPUTE", "description", "诊所与技工所对返工责任有分歧",
-                        "toothItemId", item2)));
+    void reworkPlanConfirmCauseAndRedo() {
+        // 技工所工作台可见待方案返工
+        assertEquals(1, list(data(get(labAdminToken, "/api/reworks/awaiting-plan")), "$data").size());
 
-        // 牙位 12 重做：从模型接收重新开始
+        // 技工所提交返工方案：48 小时时限、建议技工所责任、成本 200、不向诊所收费
+        Map<String, Object> plan = data(post(labAdminToken, "/api/reworks/" + reworkId + "/plan",
+                Map.of("reworkDeadlineHours", 48, "proposedResponsibility", "LAB",
+                        "reworkCost", 200, "chargeClinic", false,
+                        "labAction", "重新扫描设计边缘并加工")));
+        assertEquals("AWAITING_CONFIRM", plan.get("status"));
+        assertEquals(48, plan.get("reworkDeadlineHours"));
+        assertEquals(Boolean.FALSE, plan.get("chargeClinic"));
+
+        // 诊所工作台可见待确认方案；先驳回一次
+        assertEquals(1, list(data(get(clinicAdminToken, "/api/reworks/awaiting-confirm")), "$data").size());
+        Map<String, Object> rejected = data(post(clinicAdminToken,
+                "/api/reworks/" + reworkId + "/clinic-reject",
+                Map.of("rejectReason", "48 小时太慢，要求 24 小时内完成")));
+        assertEquals("REJECTED", rejected.get("status"));
+
+        // 非待确认状态不能确认
+        ResponseEntity<Map> confirmBad = postRaw(clinicAdminToken,
+                "/api/reworks/" + reworkId + "/clinic-confirm", Map.of());
+        assertEquals(HttpStatus.BAD_REQUEST, confirmBad.getStatusCode());
+
+        // 技工所修订方案：24 小时时限
+        data(post(labAdminToken, "/api/reworks/" + reworkId + "/plan",
+                Map.of("reworkDeadlineHours", 24, "proposedResponsibility", "LAB",
+                        "reworkCost", 200, "chargeClinic", false,
+                        "labAction", "优先重做，24 小时内完成")));
+        // 诊所确认返工方案（时限/责任/收费落定）
+        Map<String, Object> confirmed = data(post(clinicAdminToken,
+                "/api/reworks/" + reworkId + "/clinic-confirm", Map.of()));
+        assertEquals("IN_REWORK", confirmed.get("status"));
+        assertEquals("LAB", confirmed.get("responsibility"));
+        assertEquals(Boolean.TRUE, confirmed.get("clinicConfirmed"));
+
+        // 牙位 12 返工重做：从模型接收重新开始
         data(post(receiverToken, "/api/orders/" + orderId + "/items/" + item2 + "/stages",
                 stageBody("MODEL_RECEIVING", "返工模型接收", null, null, null)));
         data(post(tech1Token, "/api/orders/" + orderId + "/items/" + item2 + "/stages",
-                stageBody("SCAN_DESIGN", "返工设计", null, null, null)));
+                stageBody("SCAN_DESIGN", "返工重新设计", null, null, List.of("design_v2_12.stl"))));
         data(post(doctorToken, "/api/orders/" + orderId + "/items/" + item2 + "/confirm", null));
         data(post(tech1Token, "/api/orders/" + orderId + "/items/" + item2 + "/stages",
                 stageBody("TEETH_ARRANGEMENT", "返工排牙", null, null, null)));
@@ -250,6 +320,20 @@ class DentalLabFlowTest {
                 stageBody("SINTERING", "返工烧结", zirconiaBatchId, "1", null)));
         data(post(tech1Token, "/api/orders/" + orderId + "/items/" + item2 + "/stages",
                 stageBody("POLISHING", "返工抛光", null, null, null)));
+
+        // 返工牙位未标记原因不能通过质检
+        ResponseEntity<Map> qcBlocked = postRaw(qcToken,
+                "/api/orders/" + orderId + "/items/" + item2 + "/stages",
+                stageBody("QC", "返工质检", null, null, null));
+        assertEquals(HttpStatus.BAD_REQUEST, qcBlocked.getStatusCode());
+
+        // 技工所标记返工原因：加工问题 → 责任落定技工所
+        Map<String, Object> caused = data(post(labAdminToken,
+                "/api/reworks/" + reworkId + "/cause", Map.of("cause", "PROCESSING")));
+        assertEquals("PROCESSING", caused.get("cause"));
+        assertEquals("LAB", caused.get("responsibility"));
+        assertMoney("200.00", caused.get("labShare"));
+
         data(post(qcToken, "/api/orders/" + orderId + "/items/" + item2 + "/stages",
                 stageBody("QC", "返工质检合格", null, null, null)));
         data(post(receiverToken, "/api/orders/" + orderId + "/items/" + item2 + "/stages",
@@ -259,6 +343,16 @@ class DentalLabFlowTest {
         Map<String, Object> reworks = data(get(doctorToken, "/api/orders/" + orderId + "/reworks"));
         Map<String, Object> rework = list(reworks, "$data").get(0);
         assertEquals("COMPLETED", rework.get("status"));
+
+        // 返工重设计生成设计版本 v2 并关联返工单
+        Map<String, Object> board = data(get(labAdminToken, "/api/orders/" + orderId + "/tooth-board"));
+        List<Map<String, Object>> teeth = list(board, "teeth");
+        Map<String, Object> tooth12 = teeth.stream()
+                .filter(t -> "12".equals(t.get("toothPosition"))).findFirst().orElseThrow();
+        List<Map<String, Object>> versions = list(tooth12, "designVersions");
+        assertEquals(2, versions.size());
+        assertEquals(2, versions.get(1).get("versionNo"));
+        assertEquals(reworkId, toLong(versions.get(1).get("reworkId")));
 
         // 只重发牙位 12
         Map<String, Object> shipment = data(post(receiverToken, "/api/orders/" + orderId + "/shipments",
@@ -279,21 +373,15 @@ class DentalLabFlowTest {
         assertEquals("COMPLETED", detail.get("status"));
         assertNotNull(detail.get("completedAt"));
 
-        // 返工责任未判定前不能结算
-        ResponseEntity<Map> blocked = postRaw(financeToken, "/api/orders/" + orderId + "/settlement", null);
-        assertEquals(HttpStatus.BAD_REQUEST, blocked.getStatusCode());
-        assertTrue(String.valueOf(Objects.requireNonNull(blocked.getBody()).get("error")).contains("返工责任"));
-
-        // 技工所管理员判定责任：技工所承担 200
-        data(post(labAdminToken, "/api/reworks/" + reworkId + "/assign-responsibility",
-                Map.of("responsibility", "LAB", "reworkCost", 200)));
+        // 返工方案未确认时不能结算——此处责任已由加工问题落定，可直接结算（拦截场景见场景二）
+        data(post(financeToken, "/api/orders/" + orderId + "/settlement", null));
     }
 
     @Test
     @Order(6)
     void settlementReflectsReworkResponsibility() {
-        Map<String, Object> s = data(post(financeToken, "/api/orders/" + orderId + "/settlement", null));
-        // 基础费 500×2=1000，难度3系数1.30 → 1300；技工所承担返工 200 扣减 → 1100
+        Map<String, Object> s = data(get(financeToken, "/api/orders/" + orderId + "/settlement"));
+        // 基础费 500×2=1000，难度3系数1.30 → 1300；技工所承担返工(加工问题) 200 扣减 → 1100
         assertMoney("1000.00", s.get("baseAmount"));
         assertMoney("1.30", s.get("difficultyMultiplier"));
         assertMoney("0.00", s.get("rushFee"));
@@ -305,32 +393,81 @@ class DentalLabFlowTest {
 
     @Test
     @Order(7)
-    void monthlyStatementRequiresReworkReview() {
+    void monthlyStatementSyncDisputeAndConfirm() {
         String ym = java.time.YearMonth.now().toString();
-        // 诊所未复核返工 → 月结单生成但确认被拒
+        // 财务生成月结单
         Map<String, Object> statement = data(post(financeToken, "/api/statements/generate",
                 Map.of("clinicId", 1, "yearMonth", ym)));
         statementId = toLong(statement.get("id"));
+        assertEquals("GENERATED", statement.get("status"));
         assertEquals(1, ((Number) statement.get("unreviewedReworkCount")).intValue());
         assertMoney("1100.00", statement.get("totalAmount"));
+        assertMoney("200.00", statement.get("reworkLabDeduction"));
 
-        ResponseEntity<Map> confirmBlocked = postRaw(clinicAdminToken, "/api/statements/" + statementId + "/confirm", null);
-        assertEquals(HttpStatus.BAD_REQUEST, confirmBlocked.getStatusCode());
+        // 未同步时诊所确认被拒；未诊所确认时财务确认被拒
+        ResponseEntity<Map> earlyConfirm = postRaw(clinicAdminToken,
+                "/api/statements/" + statementId + "/confirm", Map.of());
+        assertEquals(HttpStatus.BAD_REQUEST, earlyConfirm.getStatusCode());
+        ResponseEntity<Map> earlyFinance = postRaw(financeToken,
+                "/api/statements/" + statementId + "/finance-confirm", Map.of());
+        assertEquals(HttpStatus.BAD_REQUEST, earlyFinance.getStatusCode());
 
-        // 诊所复核全部返工
-        Map<String, Object> unreviewed = data(get(clinicAdminToken, "/api/reworks/unreviewed"));
-        assertEquals(1, list(unreviewed, "$data").size());
+        // 技工所同步月结单给诊所
+        Map<String, Object> synced = data(post(labAdminToken,
+                "/api/statements/" + statementId + "/sync", Map.of()));
+        assertEquals("SYNCED", synced.get("status"));
+
+        // 同步后但返工未复核，诊所确认仍被拒
+        ResponseEntity<Map> reviewBlocked = postRaw(clinicAdminToken,
+                "/api/statements/" + statementId + "/confirm", Map.of());
+        assertEquals(HttpStatus.BAD_REQUEST, reviewBlocked.getStatusCode());
+
+        // 诊所发起月结争议（关联返工单）→ 争议中
+        Map<String, Object> dispute = data(post(clinicAdminToken,
+                "/api/statements/" + statementId + "/dispute",
+                Map.of("reason", "对加工问题责任认定有异议", "reworkId", reworkId)));
+        disputeId = toLong(dispute.get("id"));
+        assertEquals("OPEN", dispute.get("status"));
+
+        // 争议中不能确认月结
+        ResponseEntity<Map> confirmInDispute = postRaw(clinicAdminToken,
+                "/api/statements/" + statementId + "/confirm", Map.of());
+        assertEquals(HttpStatus.BAD_REQUEST, confirmInDispute.getStatusCode());
+
+        // 技工所处理争议 → 月结单重新同步诊所
+        Map<String, Object> resolved = data(post(labAdminToken,
+                "/api/statements/disputes/" + disputeId + "/resolve",
+                Map.of("resolution", "经核对加工记录确认为加工问题，维持技工所承担200")));
+        assertEquals("RESOLVED", resolved.get("status"));
+
+        // 月结单详情含争议记录与返工调整明细
+        Map<String, Object> detail = data(get(labAdminToken, "/api/statements/" + statementId));
+        assertEquals("SYNCED", detail.get("status"));
+        assertEquals(1, ((Number) detail.get("disputeCount")).intValue());
+        assertEquals(1, list(detail, "disputes").size());
+        assertEquals(1, list(detail, "reworks").size());
+
+        // 诊所复核返工 → 确认月结 → 财务确认
+        assertEquals(1, list(data(get(clinicAdminToken, "/api/reworks/unreviewed")), "$data").size());
         data(post(clinicAdminToken, "/api/reworks/" + reworkId + "/clinic-review", null));
+        Map<String, Object> confirmed = data(post(clinicAdminToken,
+                "/api/statements/" + statementId + "/confirm", Map.of()));
+        assertEquals("CLINIC_CONFIRMED", confirmed.get("status"));
+        Map<String, Object> financeConfirmed = data(post(financeToken,
+                "/api/statements/" + statementId + "/finance-confirm", Map.of()));
+        assertEquals("FINANCE_CONFIRMED", financeConfirmed.get("status"));
+        assertNotNull(financeConfirmed.get("financeConfirmedAt"));
 
-        // 复核后确认成功
-        Map<String, Object> confirmed = data(post(clinicAdminToken, "/api/statements/" + statementId + "/confirm", null));
-        assertEquals("CONFIRMED", confirmed.get("status"));
+        // 终态不能重复确认
+        ResponseEntity<Map> doubleConfirm = postRaw(financeToken,
+                "/api/statements/" + statementId + "/finance-confirm", Map.of());
+        assertEquals(HttpStatus.BAD_REQUEST, doubleConfirm.getStatusCode());
     }
 
     @Test
     @Order(8)
     void toothBoardAndPerformance() {
-        // 按牙位看板：每颗牙的设计、工序、返工责任
+        // 按牙位看板：每颗牙的设计版本、工序、返工责任/原因
         Map<String, Object> board = data(get(labAdminToken, "/api/orders/" + orderId + "/tooth-board"));
         List<Map<String, Object>> teeth = list(board, "teeth");
         assertEquals(2, teeth.size());
@@ -339,6 +476,7 @@ class DentalLabFlowTest {
         assertFalse(list(tooth12, "stages").isEmpty());
         assertEquals(1, list(tooth12, "reworks").size());
         assertEquals("LAB", list(tooth12, "reworks").get(0).get("responsibility"));
+        assertEquals("PROCESSING", list(tooth12, "reworks").get(0).get("cause"));
 
         // 技工绩效
         Map<String, Object> perf = data(get(labAdminToken, "/api/performance/technicians"));
@@ -349,11 +487,11 @@ class DentalLabFlowTest {
         assertTrue(((Number) tech1.get("stagesCompleted")).longValue() >= 5);
     }
 
-    // ---------- 第二场景：加急 + 配送延误 + 异常处理 ----------
+    // ---------- 第二场景：加急 + 配送延误 + 咬合高返工 ----------
 
     @Test
     @Order(9)
-    void rushOrderWithLateDelivery() {
+    void rushOrderWithLateDeliveryAndHighBiteRework() {
         // 诊所下单（烤瓷冠，单牙位，难度1）
         Map<String, Object> body = new HashMap<>();
         body.put("patientCode", "PAT-2026-0002");
@@ -381,7 +519,76 @@ class DentalLabFlowTest {
         assertEquals(Boolean.TRUE, rushed.get("rush"));
 
         // 快速走完工序
-        data(post(receiverToken, "/api/orders/" + oid + "/accept", null));
+        produceAll(oid, item, false);
+
+        // 发货 + 延误签收 → 试戴顺延 + 自动登记配送延误异常
+        Map<String, Object> shipment = data(post(receiverToken, "/api/orders/" + oid + "/shipments", null));
+        Long shipmentId = toLong(shipment.get("id"));
+        data(post(clinicAdminToken, "/api/shipments/" + shipmentId + "/sign",
+                Map.of("signResult", "LATE", "signedByName", "陈前台", "delayReason", "暴雨高速封路")));
+        Map<String, Object> detail = data(get(doctorToken, "/api/orders/" + oid));
+        assertTrue(list(detail, "exceptions").stream().anyMatch(e -> "DELIVERY_DELAY".equals(e.get("type"))));
+
+        // 试戴咬合高（HIGH_BITE，issueType 可省略，默认咬合高）→ 自动返工
+        Map<String, Object> high = new HashMap<>();
+        high.put("toothItemId", item);
+        high.put("result", "HIGH_BITE");
+        high.put("feedback", "正中咬合早接触，咬合高");
+        high.put("photos", List.of("tryin_36_bite.jpg"));
+        Map<String, Object> highRecord = data(post(doctorToken, "/api/orders/" + oid + "/try-ins", high));
+        assertEquals("HIGH_BITE", highRecord.get("issueType"));
+        Long rwId = toLong(highRecord.get("reworkId"));
+
+        // 返工方案 → 诊所确认为医生取模问题（向诊所收费 100）→ 重做时标记 IMPRESSION
+        data(post(labAdminToken, "/api/reworks/" + rwId + "/plan",
+                Map.of("reworkDeadlineHours", 24, "proposedResponsibility", "CLINIC",
+                        "reworkCost", 100, "chargeClinic", true, "labAction", "根据新模型重新制作")));
+        data(post(clinicAdminToken, "/api/reworks/" + rwId + "/clinic-confirm", Map.of()));
+
+        produceAll(oid, item, true);
+        // 返工重做质检前标记：医生取模问题 → 诊所承担
+        Map<String, Object> cause = data(post(labAdminToken,
+                "/api/reworks/" + rwId + "/cause", Map.of("cause", "IMPRESSION")));
+        assertEquals("CLINIC", cause.get("responsibility"));
+        assertMoney("100.00", cause.get("clinicShare"));
+
+        // 标记原因后登记返工质检与配送工序
+        data(post(qcToken, "/api/orders/" + oid + "/items/" + item + "/stages",
+                stageBody("QC", "返工质检合格", null, null, null)));
+        data(post(receiverToken, "/api/orders/" + oid + "/items/" + item + "/stages",
+                stageBody("DELIVERY", "返工打包", null, null, null)));
+
+        // 重发 + 完好签收 + 试戴密合 → 完成
+        Map<String, Object> ship2 = data(post(receiverToken, "/api/orders/" + oid + "/shipments", null));
+        data(post(clinicAdminToken, "/api/shipments/" + toLong(ship2.get("id")) + "/sign",
+                Map.of("signResult", "GOOD", "signedByName", "陈前台")));
+        Map<String, Object> fit = new HashMap<>();
+        fit.put("toothItemId", item);
+        fit.put("result", "FIT");
+        fit.put("experienceScore", 4);
+        data(post(doctorToken, "/api/orders/" + oid + "/try-ins", fit));
+        assertEquals("COMPLETED",
+                data(get(doctorToken, "/api/orders/" + oid)).get("status"));
+
+        // 结算：300×1×1.0=300，加急 90，诊所承担取模返工 100，延误扣罚 15 → 475
+        Map<String, Object> s = data(post(financeToken, "/api/orders/" + oid + "/settlement", null));
+        assertMoney("300.00", s.get("baseAmount"));
+        assertMoney("90.00", s.get("rushFee"));
+        assertMoney("100.00", s.get("reworkClinicShare"));
+        assertMoney("15.00", s.get("deliveryPenalty"));
+        assertMoney("475.00", s.get("totalAmount"));
+    }
+
+    // ---------- 工具方法 ----------
+
+    /**
+     * 单牙位走工序；rework=false 走完全部八道（含接单/质检/配送），
+     * rework=true 为返工重做：不接单，止于抛光（质检前需先标记返工原因）。
+     */
+    private void produceAll(Long oid, Long item, boolean rework) {
+        if (!rework) {
+            data(post(receiverToken, "/api/orders/" + oid + "/accept", null));
+        }
         data(post(receiverToken, "/api/orders/" + oid + "/items/" + item + "/stages",
                 stageBody("MODEL_RECEIVING", null, null, null, null)));
         data(post(tech1Token, "/api/orders/" + oid + "/items/" + item + "/stages",
@@ -393,35 +600,13 @@ class DentalLabFlowTest {
                 stageBody("SINTERING", null, null, null, null)));
         data(post(tech1Token, "/api/orders/" + oid + "/items/" + item + "/stages",
                 stageBody("POLISHING", null, null, null, null)));
-        data(post(qcToken, "/api/orders/" + oid + "/items/" + item + "/stages",
-                stageBody("QC", null, null, null, null)));
-        data(post(receiverToken, "/api/orders/" + oid + "/items/" + item + "/stages",
-                stageBody("DELIVERY", null, null, null, null)));
-
-        // 发货 + 延误签收 → 试戴顺延 + 自动登记配送延误异常
-        Map<String, Object> shipment = data(post(receiverToken, "/api/orders/" + oid + "/shipments", null));
-        Long shipmentId = toLong(shipment.get("id"));
-        data(post(clinicAdminToken, "/api/shipments/" + shipmentId + "/sign",
-                Map.of("signResult", "LATE", "signedByName", "陈前台", "delayReason", "暴雨高速封路")));
-        Map<String, Object> detail = data(get(doctorToken, "/api/orders/" + oid));
-        assertTrue(list(detail, "exceptions").stream().anyMatch(e -> "DELIVERY_DELAY".equals(e.get("type"))));
-
-        // 试戴密合 → 完成
-        Map<String, Object> fit = new HashMap<>();
-        fit.put("toothItemId", item);
-        fit.put("result", "FIT");
-        fit.put("experienceScore", 4);
-        data(post(doctorToken, "/api/orders/" + oid + "/try-ins", fit));
-
-        // 结算：300×1×1.0 + 加急 300×0.3=90 − 延误扣罚 300×0.05=15 → 375
-        Map<String, Object> s = data(post(financeToken, "/api/orders/" + oid + "/settlement", null));
-        assertMoney("300.00", s.get("baseAmount"));
-        assertMoney("90.00", s.get("rushFee"));
-        assertMoney("15.00", s.get("deliveryPenalty"));
-        assertMoney("375.00", s.get("totalAmount"));
+        if (!rework) {
+            data(post(qcToken, "/api/orders/" + oid + "/items/" + item + "/stages",
+                    stageBody("QC", null, null, null, null)));
+            data(post(receiverToken, "/api/orders/" + oid + "/items/" + item + "/stages",
+                    stageBody("DELIVERY", null, null, null, null)));
+        }
     }
-
-    // ---------- 工具方法 ----------
 
     private String login(String username, String password) {
         Map<String, Object> resp = data(plain.postForEntity(url("/api/auth/login"),
@@ -483,6 +668,7 @@ class DentalLabFlowTest {
     }
 
     private void assertMoney(String expected, Object actual) {
+        assertNotNull(actual, "金额为空: expected=" + expected);
         assertEquals(0, new BigDecimal(expected).compareTo(new BigDecimal(String.valueOf(actual))),
                 () -> "金额不符: expected=" + expected + " actual=" + actual);
     }

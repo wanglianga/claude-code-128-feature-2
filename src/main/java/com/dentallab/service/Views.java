@@ -72,6 +72,7 @@ public final class Views {
         m.put("currentStage", t.getCurrentStage() == null ? null : t.getCurrentStage().name());
         m.put("currentStageLabel", t.getCurrentStage() == null ? null : t.getCurrentStage().getLabel());
         m.put("designSummary", t.getDesignSummary());
+        m.put("designVersionNo", t.getDesignVersionNo());
         m.put("shipmentId", t.getShipment() == null ? null : t.getShipment().getId());
         return m;
     }
@@ -150,13 +151,36 @@ public final class Views {
         m.put("id", r.getId());
         m.put("orderId", r.getOrder().getId());
         m.put("orderNo", r.getOrder().getOrderNo());
+        m.put("clinicId", r.getOrder().getClinic().getId());
         m.put("toothItemId", r.getToothItem().getId());
         m.put("toothPosition", r.getToothItem().getToothPosition());
         m.put("reason", r.getReason());
-        m.put("responsibility", r.getResponsibility().name());
-        m.put("responsibilityLabel", r.getResponsibility().getLabel());
+        m.put("issueType", r.getIssueType() == null ? null : r.getIssueType().name());
+        m.put("issueTypeLabel", r.getIssueType() == null ? null : r.getIssueType().getLabel());
+        m.put("tryInPhotos", r.getTryInPhotos());
+        m.put("doctorNotes", r.getDoctorNotes());
+        m.put("tryInId", r.getTryIn() == null ? null : r.getTryIn().getId());
+        m.put("designVersionId", r.getDesignVersion() == null ? null : r.getDesignVersion().getId());
+        m.put("designVersionNo", r.getDesignVersion() == null ? null : r.getDesignVersion().getVersionNo());
         m.put("status", r.getStatus().name());
         m.put("statusLabel", r.getStatus().getLabel());
+        m.put("reworkDeadlineHours", r.getReworkDeadlineHours());
+        m.put("proposedResponsibility", r.getProposedResponsibility() == null ? null : r.getProposedResponsibility().name());
+        m.put("proposedResponsibilityLabel",
+                r.getProposedResponsibility() == null ? null : r.getProposedResponsibility().getLabel());
+        m.put("responsibility", r.getResponsibility() == null ? null : r.getResponsibility().name());
+        m.put("responsibilityLabel", r.getResponsibility() == null ? null : r.getResponsibility().getLabel());
+        m.put("chargeClinic", r.getChargeClinic());
+        m.put("labAction", r.getLabAction());
+        m.put("planSubmittedAt", r.getPlanSubmittedAt());
+        m.put("plannedBy", r.getPlannedBy() == null ? null : r.getPlannedBy().getDisplayName());
+        m.put("rejectReason", r.getRejectReason());
+        m.put("clinicConfirmed", r.isClinicConfirmed());
+        m.put("confirmedBy", r.getConfirmedBy() == null ? null : r.getConfirmedBy().getDisplayName());
+        m.put("confirmedAt", r.getConfirmedAt());
+        m.put("cause", r.getCause() == null ? null : r.getCause().name());
+        m.put("causeLabel", r.getCause() == null ? null : r.getCause().getLabel());
+        m.put("causeMarkedAt", r.getCauseMarkedAt());
         m.put("reworkCost", r.getReworkCost());
         m.put("clinicShare", r.getClinicShare());
         m.put("labShare", r.getLabShare());
@@ -165,6 +189,38 @@ public final class Views {
         m.put("reviewedAt", r.getReviewedAt());
         m.put("createdAt", r.getCreatedAt());
         m.put("completedAt", r.getCompletedAt());
+        return m;
+    }
+
+    public static Map<String, Object> designVersion(DesignVersion v) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", v.getId());
+        m.put("orderId", v.getOrder().getId());
+        m.put("toothItemId", v.getToothItem().getId());
+        m.put("toothPosition", v.getToothItem().getToothPosition());
+        m.put("versionNo", v.getVersionNo());
+        m.put("designFiles", v.getDesignFiles());
+        m.put("summary", v.getSummary());
+        m.put("designedBy", v.getDesignedBy() == null ? null : v.getDesignedBy().getDisplayName());
+        m.put("reworkId", v.getRework() == null ? null : v.getRework().getId());
+        m.put("createdAt", v.getCreatedAt());
+        return m;
+    }
+
+    public static Map<String, Object> dispute(StatementDispute d) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", d.getId());
+        m.put("statementId", d.getStatement().getId());
+        m.put("reason", d.getReason());
+        m.put("reworkId", d.getRework() == null ? null : d.getRework().getId());
+        m.put("raisedBy", d.getRaisedBy().getDisplayName());
+        m.put("raisedByRole", d.getRaisedBy().getRole().name());
+        m.put("status", d.getStatus().name());
+        m.put("statusLabel", d.getStatus().getLabel());
+        m.put("resolvedBy", d.getResolvedBy() == null ? null : d.getResolvedBy().getDisplayName());
+        m.put("resolution", d.getResolution());
+        m.put("createdAt", d.getCreatedAt());
+        m.put("resolvedAt", d.getResolvedAt());
         return m;
     }
 
@@ -221,8 +277,14 @@ public final class Views {
         m.put("actualAt", t.getActualAt());
         m.put("result", t.getResult() == null ? null : t.getResult().name());
         m.put("resultLabel", t.getResult() == null ? null : t.getResult().getLabel());
+        m.put("issueType", t.getIssueType() == null ? null : t.getIssueType().name());
+        m.put("issueTypeLabel", t.getIssueType() == null ? null : t.getIssueType().getLabel());
         m.put("feedback", t.getFeedback());
+        m.put("photos", t.getPhotos());
         m.put("experienceScore", t.getExperienceScore());
+        m.put("doctorName", t.getDoctor() == null ? null : t.getDoctor().getDisplayName());
+        m.put("reworkId", t.getRework() == null ? null : t.getRework().getId());
+        m.put("createdAt", t.getCreatedAt());
         return m;
     }
 
@@ -251,11 +313,18 @@ public final class Views {
         m.put("yearMonth", s.getYearMonth());
         m.put("orderCount", s.getOrderCount());
         m.put("totalAmount", s.getTotalAmount());
+        m.put("reworkClinicShare", s.getReworkClinicShare());
+        m.put("reworkLabDeduction", s.getReworkLabDeduction());
+        m.put("disputeCount", s.getDisputeCount());
         m.put("unreviewedReworkCount", s.getUnreviewedReworkCount());
         m.put("status", s.getStatus().name());
         m.put("statusLabel", s.getStatus().getLabel());
         m.put("generatedAt", s.getGeneratedAt());
+        m.put("syncedAt", s.getSyncedAt());
+        m.put("syncedBy", s.getSyncedBy() == null ? null : s.getSyncedBy().getDisplayName());
         m.put("confirmedAt", s.getConfirmedAt());
+        m.put("financeConfirmedAt", s.getFinanceConfirmedAt());
+        m.put("financeConfirmedBy", s.getFinanceConfirmedBy() == null ? null : s.getFinanceConfirmedBy().getDisplayName());
         return m;
     }
 }

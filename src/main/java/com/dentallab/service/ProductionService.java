@@ -35,13 +35,14 @@ public class ProductionService {
     private final ReworkRecordRepo reworkRepo;
     private final ShipmentRepo shipmentRepo;
     private final TryInRecordRepo tryInRepo;
+    private final DesignVersionRepo designVersionRepo;
     private final AuthService authService;
 
     public ProductionService(DentureOrderRepo orderRepo, ToothItemRepo itemRepo, StageRecordRepo stageRepo,
                              MaterialBatchRepo batchRepo, DesignAnnotationRepo annotationRepo,
                              OrderExceptionRepo exceptionRepo, ReworkRecordRepo reworkRepo,
                              ShipmentRepo shipmentRepo, TryInRecordRepo tryInRepo,
-                             AuthService authService) {
+                             DesignVersionRepo designVersionRepo, AuthService authService) {
         this.orderRepo = orderRepo;
         this.itemRepo = itemRepo;
         this.stageRepo = stageRepo;
@@ -51,6 +52,7 @@ public class ProductionService {
         this.reworkRepo = reworkRepo;
         this.shipmentRepo = shipmentRepo;
         this.tryInRepo = tryInRepo;
+        this.designVersionRepo = designVersionRepo;
         this.authService = authService;
     }
 
@@ -71,7 +73,12 @@ public class ProductionService {
             throw new BizException("医生确认请由诊所医生调用确认接口 /confirm");
         }
         checkStageRole(operator, stage);
+        ensureReworkConfirmed(item);
         checkStageSequence(item, stage);
+        // 返工重做质检前必须先标记返工原因（设计/加工/医生取模）
+        if (finish && stage == StageType.QC) {
+            ensureReworkCauseMarked(item);
+        }
 
         StageRecord record = new StageRecord();
         record.setToothItem(item);
@@ -102,6 +109,10 @@ public class ProductionService {
         }
         if (finish) {
             record.setFinishedAt(LocalDateTime.now());
+            // 扫描设计完成 → 生成设计版本（返工重设计递增版本并关联返工单）
+            if (stage == StageType.SCAN_DESIGN) {
+                createDesignVersion(item, operator, photos, designSummary);
+            }
             advanceItem(item, stage);
         }
         stageRepo.save(record);
@@ -122,6 +133,7 @@ public class ProductionService {
                 && (doctor.getClinic() == null || !doctor.getClinic().getId().equals(order.getClinic().getId()))) {
             throw BizException.forbidden("只能由本诊所医生确认该订单设计");
         }
+        ensureReworkConfirmed(item);
         checkStageSequence(item, StageType.DOCTOR_CONFIRM);
 
         StageRecord record = new StageRecord();
@@ -178,7 +190,7 @@ public class ProductionService {
         return Views.annotation(annotation);
     }
 
-    /** 按牙位的生产看板：设计、制作、质检、配送、试戴与返工责任一目了然。 */
+    /** 按牙位的生产看板：设计版本、制作、质检、配送、试戴与返工责任一目了然。 */
     @Transactional(readOnly = true)
     public Map<String, Object> toothBoard(Long orderId) {
         DentureOrder order = orderRepo.findById(orderId)
@@ -186,6 +198,7 @@ public class ProductionService {
         Map<String, Object> board = new LinkedHashMap<>();
         board.put("order", Views.order(order));
         List<ReworkRecord> orderReworks = reworkRepo.findByOrderIdOrderByIdAsc(orderId);
+        List<DesignVersion> orderVersions = designVersionRepo.findByOrderIdOrderByIdAsc(orderId);
         List<Map<String, Object>> teeth = new ArrayList<>();
         for (ToothItem item : itemRepo.findByOrderIdOrderByIdAsc(orderId)) {
             Map<String, Object> tooth = Views.item(item);
@@ -193,6 +206,9 @@ public class ProductionService {
                     .map(Views::stage).collect(Collectors.toList()));
             tooth.put("annotations", annotationRepo.findByToothItemIdOrderByIdAsc(item.getId()).stream()
                     .map(Views::annotation).collect(Collectors.toList()));
+            tooth.put("designVersions", orderVersions.stream()
+                    .filter(v -> v.getToothItem().getId().equals(item.getId()))
+                    .map(Views::designVersion).collect(Collectors.toList()));
             tooth.put("reworks", orderReworks.stream()
                     .filter(r -> r.getToothItem().getId().equals(item.getId()))
                     .map(Views::rework).collect(Collectors.toList()));
@@ -207,6 +223,47 @@ public class ProductionService {
     }
 
     // ---- 内部逻辑 ----
+
+    private void createDesignVersion(ToothItem item, Account designer, List<String> photos, String summary) {
+        int nextNo = designVersionRepo.findTopByToothItemIdOrderByVersionNoDesc(item.getId())
+                .map(DesignVersion::getVersionNo).orElse(0) + 1;
+        DesignVersion version = new DesignVersion();
+        version.setOrder(item.getOrder());
+        version.setToothItem(item);
+        version.setVersionNo(nextNo);
+        if (photos != null && !photos.isEmpty()) {
+            version.setDesignFiles(String.join(",", photos));
+        }
+        version.setSummary(summary != null ? summary
+                : (item.getDesignSummary() != null ? item.getDesignSummary() : "设计版本 v" + nextNo));
+        version.setDesignedBy(designer);
+        // 返工重设计关联当前返工单
+        reworkRepo.findByToothItemIdAndStatus(item.getId(), ReworkStatus.IN_REWORK).stream()
+                .findFirst().ifPresent(version::setRework);
+        designVersionRepo.save(version);
+        item.setDesignVersionNo(nextNo);
+    }
+
+    private void ensureReworkConfirmed(ToothItem item) {
+        List<ReworkRecord> active = reworkRepo.findByToothItemIdAndStatusNot(item.getId(), ReworkStatus.COMPLETED);
+        if (active.isEmpty()) {
+            return;
+        }
+        ReworkRecord rework = active.get(0);
+        if (rework.getStatus() != ReworkStatus.IN_REWORK) {
+            throw new BizException("牙位 " + item.getToothPosition() + " 的返工方案尚未经诊所确认（当前: "
+                    + rework.getStatus().getLabel() + "），不能开始返工重做");
+        }
+    }
+
+    private void ensureReworkCauseMarked(ToothItem item) {
+        for (ReworkRecord rework : reworkRepo.findByToothItemIdAndStatus(item.getId(), ReworkStatus.IN_REWORK)) {
+            if (rework.getCause() == null) {
+                throw new BizException("返工单#" + rework.getId() + " 尚未标记返工原因"
+                        + "（DESIGN 设计问题/PROCESSING 加工问题/IMPRESSION 医生取模问题），返工牙位不能通过质检");
+            }
+        }
+    }
 
     private ToothItem getItem(Long orderId, Long itemId) {
         ToothItem item = itemRepo.findById(itemId).orElseThrow(() -> BizException.notFound("牙位明细#" + itemId));
@@ -251,9 +308,9 @@ public class ProductionService {
     private void advanceItem(ToothItem item, StageType finishedStage) {
         item.setCurrentStage(finishedStage);
         item.setStatus(STATUS_AFTER_STAGE.get(finishedStage));
-        // 返工中的牙位重新通过质检后，自动关闭未完成的返工单
+        // 返工中的牙位重新通过质检后，自动关闭返工单（原因须已标记）
         if (finishedStage == StageType.QC) {
-            for (ReworkRecord rework : reworkRepo.findByToothItemIdAndStatus(item.getId(), ReworkStatus.OPEN)) {
+            for (ReworkRecord rework : reworkRepo.findByToothItemIdAndStatus(item.getId(), ReworkStatus.IN_REWORK)) {
                 rework.setStatus(ReworkStatus.COMPLETED);
                 rework.setCompletedAt(LocalDateTime.now());
                 reworkRepo.save(rework);

@@ -1,0 +1,9 @@
+target/
+.idea/
+*.iml
+.git/
+.gitignore
+.claude/
+verify.sh
+*.log
+README.md

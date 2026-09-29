@@ -38,6 +38,10 @@ public class ToothItem {
     @Column(length = 500)
     private String designSummary;
 
+    /** 当前设计版本号（首版 1，返工重设计递增）。 */
+    @Column(nullable = false)
+    private Integer designVersionNo = 0;
+
     /** 最近一次发货所属配送单。 */
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "shipment_id")

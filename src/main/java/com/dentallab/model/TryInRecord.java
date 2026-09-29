@@ -6,7 +6,7 @@ import lombok.Setter;
 
 import java.time.LocalDateTime;
 
-/** 试戴记录：配送签收后自动生成安排，诊所回填试戴结果与患者体验。 */
+/** 试戴记录：配送签收后自动生成安排，诊所回填试戴结果、医生备注与试戴照片。 */
 @Getter
 @Setter
 @Entity
@@ -35,12 +35,31 @@ public class TryInRecord {
     @Column(length = 20)
     private TryInResult result;
 
-    /** 患者试戴体验反馈。 */
+    /** 不密合的具体表现：咬合高 / 边缘不密合（result 非密合时必填）。 */
+    @Enumerated(EnumType.STRING)
+    @Column(length = 20)
+    private MisfitType issueType;
+
+    /** 医生试戴备注（咬合高/边缘不密合的描述）。 */
     @Column(length = 1000)
     private String feedback;
 
+    /** 试戴照片（多个以英文逗号分隔的地址/文件名）。 */
+    @Column(length = 1000)
+    private String photos;
+
     /** 患者体验评分 1-5。 */
     private Integer experienceScore;
+
+    /** 记录试戴的医生。 */
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "doctor_id")
+    private Account doctor;
+
+    /** 不密合时自动创建并关联的返工单。 */
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "rework_id")
+    private ReworkRecord rework;
 
     @Column(nullable = false)
     private LocalDateTime createdAt = LocalDateTime.now();

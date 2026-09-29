@@ -11,7 +11,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-/** 试戴：诊所回填试戴结果与患者体验；不密合自动触发异常与返工。 */
+/**
+ * 试戴：诊所医生回填试戴结果（咬合高/边缘不密合）、医生备注与试戴照片。
+ * 不密合自动触发“试戴不密合”异常，并对牙位创建返工单（待技工所提交返工方案），
+ * 返工单关联设计版本、医生备注、技工可查看的试戴照片。
+ */
 @Service
 public class TryInService {
 
@@ -20,26 +24,30 @@ public class TryInService {
     private final ToothItemRepo itemRepo;
     private final OrderExceptionRepo exceptionRepo;
     private final ReworkRecordRepo reworkRepo;
+    private final DesignVersionRepo designVersionRepo;
     private final AuthService authService;
 
     public TryInService(TryInRecordRepo tryInRepo, DentureOrderRepo orderRepo, ToothItemRepo itemRepo,
                         OrderExceptionRepo exceptionRepo, ReworkRecordRepo reworkRepo,
-                        AuthService authService) {
+                        DesignVersionRepo designVersionRepo, AuthService authService) {
         this.tryInRepo = tryInRepo;
         this.orderRepo = orderRepo;
         this.itemRepo = itemRepo;
         this.exceptionRepo = exceptionRepo;
         this.reworkRepo = reworkRepo;
+        this.designVersionRepo = designVersionRepo;
         this.authService = authService;
     }
 
     /**
      * 记录试戴结果。toothItemId 为空表示整单试戴。
-     * 不密合：牙位打回返工（责任待判定），并自动登记试戴不密合异常。
+     * result=FIT 密合；MISFIT 需指定 issueType（EDGE_GAP 边缘不密合）；HIGH_BITE 咬合高。
+     * 不密合/咬合高：牙位打回，创建待方案返工单（关联当前设计版本、医生备注、试戴照片），并自动登记异常。
      */
     @Transactional
     public Map<String, Object> recordResult(Account doctor, Long orderId, Long toothItemId,
-                                            TryInResult result, String feedback, Integer experienceScore) {
+                                            TryInResult result, MisfitType issueType, String feedback,
+                                            List<String> photos, Integer experienceScore) {
         authService.requireRole(doctor, Role.CLINIC_DOCTOR, Role.CLINIC_ADMIN);
         DentureOrder order = orderRepo.findById(orderId)
                 .orElseThrow(() -> BizException.notFound("订单#" + orderId));
@@ -48,6 +56,16 @@ public class TryInService {
         }
         if (experienceScore != null && (experienceScore < 1 || experienceScore > 5)) {
             throw new BizException("患者体验评分 experienceScore 必须在 1-5 之间");
+        }
+        MisfitType effectiveIssue = issueType;
+        if (result == TryInResult.HIGH_BITE && effectiveIssue == null) {
+            effectiveIssue = MisfitType.HIGH_BITE;
+        }
+        if (result != TryInResult.FIT && effectiveIssue == null) {
+            throw new BizException("不密合试戴必须说明问题类型 issueType：HIGH_BITE(咬合高)/EDGE_GAP(边缘不密合)/BOTH(两者)");
+        }
+        if (result == TryInResult.FIT) {
+            effectiveIssue = null;
         }
         ToothItem item = null;
         if (toothItemId != null) {
@@ -64,9 +82,13 @@ public class TryInService {
         record.setScheduledAt(LocalDateTime.now());
         record.setActualAt(LocalDateTime.now());
         record.setResult(result);
+        record.setIssueType(effectiveIssue);
         record.setFeedback(feedback);
+        if (photos != null && !photos.isEmpty()) {
+            record.setPhotos(String.join(",", photos));
+        }
         record.setExperienceScore(experienceScore);
-        tryInRepo.save(record);
+        record.setDoctor(doctor);
 
         List<ToothItem> targets = item != null ? List.of(item) : itemRepo.findByOrderIdOrderByIdAsc(orderId);
         if (result == TryInResult.FIT) {
@@ -76,28 +98,42 @@ public class TryInService {
                 itemRepo.save(t);
             }
         } else {
+            String photoStr = record.getPhotos();
             for (ToothItem t : targets) {
                 t.setStatus(ToothItemStatus.REWORKING);
                 t.setCurrentStage(null);
                 t.setUpdatedAt(LocalDateTime.now());
                 itemRepo.save(t);
-                if (reworkRepo.findByToothItemIdAndStatus(t.getId(), ReworkStatus.OPEN).isEmpty()) {
+                // 同一牙位已有未完成返工单时不重复创建
+                if (reworkRepo.findByToothItemIdAndStatusNot(t.getId(), ReworkStatus.COMPLETED).isEmpty()) {
                     ReworkRecord rework = new ReworkRecord();
                     rework.setOrder(order);
                     rework.setToothItem(t);
-                    rework.setReason("试戴不密合: " + (feedback == null ? "患者试戴不密合" : feedback));
+                    rework.setIssueType(effectiveIssue);
+                    rework.setTryInPhotos(photoStr);
+                    rework.setDoctorNotes(feedback);
+                    rework.setReason("试戴" + effectiveIssue.getLabel() + ": "
+                            + (feedback == null || feedback.isBlank() ? "医生试戴反馈" : feedback));
+                    rework.setStatus(ReworkStatus.AWAITING_PLAN);
+                    // 返工关联设计版本：当前牙位最近一版设计
+                    designVersionRepo.findTopByToothItemIdOrderByVersionNoDesc(t.getId())
+                            .ifPresent(rework::setDesignVersion);
                     reworkRepo.save(rework);
+                    record.setRework(rework);
                 }
             }
             OrderException event = new OrderException();
             event.setOrder(order);
             event.setToothItem(item);
             event.setType(ExceptionType.TRY_IN_MISFIT);
-            event.setDescription("试戴不密合" + (item != null ? "（牙位 " + item.getToothPosition() + "）" : "")
-                    + ": " + (feedback == null ? "" : feedback));
+            event.setDescription("试戴" + effectiveIssue.getLabel()
+                    + (item != null ? "（牙位 " + item.getToothPosition() + "）" : "")
+                    + ": " + (feedback == null ? "" : feedback)
+                    + (photos != null && !photos.isEmpty() ? "；附试戴照片 " + photos.size() + " 张" : ""));
             event.setReportedBy(doctor);
             exceptionRepo.save(event);
         }
+        tryInRepo.save(record);
 
         refreshOrderAfterTryIn(order);
         return Views.tryIn(record);

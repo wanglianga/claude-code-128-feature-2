@@ -121,8 +121,11 @@ public class DeliveryService {
                                 + (delayReason == null ? "" : "，原因: " + delayReason));
             }
             case DAMAGED -> {
-                // 破损：本批次牙位返工，责任待判定
+                // 破损：本批次牙位返工，待技工所提交返工方案、诊所确认后重做
                 for (ToothItem item : items) {
+                    if (!reworkRepo.findByToothItemIdAndStatusNot(item.getId(), ReworkStatus.COMPLETED).isEmpty()) {
+                        continue;
+                    }
                     item.setStatus(ToothItemStatus.REWORKING);
                     item.setCurrentStage(null);
                     item.setUpdatedAt(LocalDateTime.now());
@@ -131,6 +134,7 @@ public class DeliveryService {
                     rework.setOrder(order);
                     rework.setToothItem(item);
                     rework.setReason("配送破损签收，需重新制作");
+                    rework.setStatus(ReworkStatus.AWAITING_PLAN);
                     reworkRepo.save(rework);
                 }
                 order.setStatus(OrderStatus.IN_PRODUCTION);
