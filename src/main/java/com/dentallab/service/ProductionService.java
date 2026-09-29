@@ -35,12 +35,14 @@ public class ProductionService {
     private final ReworkRecordRepo reworkRepo;
     private final ShipmentRepo shipmentRepo;
     private final TryInRecordRepo tryInRepo;
+    private final DesignVersionRepo designVersionRepo;
     private final AuthService authService;
 
     public ProductionService(DentureOrderRepo orderRepo, ToothItemRepo itemRepo, StageRecordRepo stageRepo,
                              MaterialBatchRepo batchRepo, DesignAnnotationRepo annotationRepo,
                              OrderExceptionRepo exceptionRepo, ReworkRecordRepo reworkRepo,
                              ShipmentRepo shipmentRepo, TryInRecordRepo tryInRepo,
+                             DesignVersionRepo designVersionRepo,
                              AuthService authService) {
         this.orderRepo = orderRepo;
         this.itemRepo = itemRepo;
@@ -51,6 +53,7 @@ public class ProductionService {
         this.reworkRepo = reworkRepo;
         this.shipmentRepo = shipmentRepo;
         this.tryInRepo = tryInRepo;
+        this.designVersionRepo = designVersionRepo;
         this.authService = authService;
     }
 
@@ -66,6 +69,10 @@ public class ProductionService {
         ToothItem item = getItem(orderId, itemId);
         DentureOrder order = item.getOrder();
         ensureOrderInProduction(operator, order);
+        if (item.getStatus() == ToothItemStatus.AWAIT_REWORK_CONFIRM) {
+            throw new BizException("牙位 " + item.getToothPosition()
+                    + " 的返工尚待诊所确认（返工时限/是否收费），确认后才能重做");
+        }
 
         if (stage == StageType.DOCTOR_CONFIRM) {
             throw new BizException("医生确认请由诊所医生调用确认接口 /confirm");
@@ -103,6 +110,10 @@ public class ProductionService {
         if (finish) {
             record.setFinishedAt(LocalDateTime.now());
             advanceItem(item, stage);
+            // 完成扫描设计 → 固化一个设计版本（返工重做产生新版本，并关联本次返工单）
+            if (stage == StageType.SCAN_DESIGN) {
+                createDesignVersion(item, record);
+            }
         }
         stageRepo.save(record);
         item.setUpdatedAt(LocalDateTime.now());
@@ -193,6 +204,8 @@ public class ProductionService {
                     .map(Views::stage).collect(Collectors.toList()));
             tooth.put("annotations", annotationRepo.findByToothItemIdOrderByIdAsc(item.getId()).stream()
                     .map(Views::annotation).collect(Collectors.toList()));
+            tooth.put("designVersions", designVersionRepo.findByToothItemIdOrderByVersionAsc(item.getId()).stream()
+                    .map(Views::designVersion).collect(Collectors.toList()));
             tooth.put("reworks", orderReworks.stream()
                     .filter(r -> r.getToothItem().getId().equals(item.getId()))
                     .map(Views::rework).collect(Collectors.toList()));
@@ -251,14 +264,29 @@ public class ProductionService {
     private void advanceItem(ToothItem item, StageType finishedStage) {
         item.setCurrentStage(finishedStage);
         item.setStatus(STATUS_AFTER_STAGE.get(finishedStage));
-        // 返工中的牙位重新通过质检后，自动关闭未完成的返工单
+        // 返工中的牙位重新通过质检后，自动关闭已确认、未完成的返工单
         if (finishedStage == StageType.QC) {
-            for (ReworkRecord rework : reworkRepo.findByToothItemIdAndStatus(item.getId(), ReworkStatus.OPEN)) {
+            for (ReworkRecord rework : reworkRepo.findByToothItemIdAndStatus(item.getId(), ReworkStatus.CONFIRMED)) {
                 rework.setStatus(ReworkStatus.COMPLETED);
                 rework.setCompletedAt(LocalDateTime.now());
                 reworkRepo.save(rework);
             }
         }
+    }
+
+    /** 完成扫描设计后固化设计版本；返工重做的版本关联触发它的返工单。 */
+    private void createDesignVersion(ToothItem item, StageRecord record) {
+        List<DesignVersion> existing = designVersionRepo.findByToothItemIdOrderByVersionAsc(item.getId());
+        DesignVersion v = new DesignVersion();
+        v.setToothItem(item);
+        v.setVersion(existing.size() + 1);
+        v.setDesignSummary(item.getDesignSummary());
+        v.setDesigner(record.getOperator());
+        v.setPhotos(record.getPhotos());
+        v.setNote(record.getNote());
+        reworkRepo.findByToothItemIdAndStatus(item.getId(), ReworkStatus.CONFIRMED).stream()
+                .findFirst().ifPresent(v::setRework);
+        designVersionRepo.save(v);
     }
 
     private void refreshOrderStatus(DentureOrder order) {

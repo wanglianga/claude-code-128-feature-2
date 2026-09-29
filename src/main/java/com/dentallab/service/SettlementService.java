@@ -57,6 +57,12 @@ public class SettlementService {
         if (pending > 0) {
             throw new BizException("存在 " + pending + " 条返工责任未判定（返工责任不清），请先判定责任再结算");
         }
+        long causePending = reworks.stream()
+                .filter(r -> r.getStatus() == ReworkStatus.CONFIRMED || r.getStatus() == ReworkStatus.COMPLETED)
+                .filter(r -> r.getCause() == null).count();
+        if (causePending > 0) {
+            throw new BizException("存在 " + causePending + " 条返工尚未标记原因（设计问题/加工问题/医生取模问题），请先标记再结算");
+        }
 
         int toothCount = itemRepo.findByOrderIdOrderByIdAsc(orderId).size();
         PriceConfig price = priceConfigRepo.findByProsthesisType(order.getProsthesisType())
@@ -108,7 +114,8 @@ public class SettlementService {
                 "基础费=%s×%d牙位=%s; 难度系数=%s(难度%d); 加急费=%s; 诊所承担返工=%s; 技工所承担返工(扣减)=%s; 配送扣罚=%s%s; 应付=%s",
                 price.getBasePrice(), toothCount, base, multiplier, order.getDifficulty(),
                 rushFee, clinicShare, labShare, deliveryPenalty,
-                penaltyNote.length() == 0 ? "" : "(" + penaltyNote + ")", total));
+                penaltyNote.length() == 0 ? "" : "(" + penaltyNote + ")", total)
+                + reworkCauseBreakdown(reworks));
         settlementRepo.save(settlement);
         return Views.settlement(settlement);
     }
@@ -118,5 +125,16 @@ public class SettlementService {
         Settlement settlement = settlementRepo.findByOrderId(orderId)
                 .orElseThrow(() -> BizException.notFound("订单#" + orderId + "的结算单"));
         return Views.settlement(settlement);
+    }
+
+    /** 返工责任调整明细：逐条列出原因分类→责任→金额。 */
+    private String reworkCauseBreakdown(List<ReworkRecord> reworks) {
+        String breakdown = reworks.stream()
+                .filter(r -> r.getCause() != null)
+                .map(r -> "返工#" + r.getId() + "[" + r.getToothItem().getToothPosition() + "]"
+                        + r.getCause().getLabel() + "→" + r.getResponsibility().getLabel()
+                        + "(诊所" + r.getClinicShare() + "/技工所" + r.getLabShare() + ")")
+                .reduce((a, b) -> a + "; " + b).orElse("");
+        return breakdown.isEmpty() ? "" : "; 返工责任调整: " + breakdown;
     }
 }

@@ -99,6 +99,25 @@ public final class Req {
         return Boolean.parseBoolean(String.valueOf(v).trim());
     }
 
+    /** 解析布尔值；字段缺省返回 null（用于必须显式确认的 true/false 入参）。 */
+    public static Boolean boolVal(Map<String, Object> body, String key) {
+        Object v = body.get(key);
+        if (v == null || String.valueOf(v).isBlank()) {
+            return null;
+        }
+        if (v instanceof Boolean b) {
+            return b;
+        }
+        String s = String.valueOf(v).trim();
+        if ("true".equalsIgnoreCase(s)) {
+            return Boolean.TRUE;
+        }
+        if ("false".equalsIgnoreCase(s)) {
+            return Boolean.FALSE;
+        }
+        throw new BizException(key + " 必须是 true 或 false");
+    }
+
     public static LocalDate date(Map<String, Object> body, String key) {
         String v = str(body, key);
         if (v == null || v.isEmpty()) {

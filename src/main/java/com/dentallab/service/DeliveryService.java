@@ -20,18 +20,18 @@ public class DeliveryService {
     private final ToothItemRepo itemRepo;
     private final TryInRecordRepo tryInRepo;
     private final OrderExceptionRepo exceptionRepo;
-    private final ReworkRecordRepo reworkRepo;
+    private final ReworkService reworkService;
     private final AuthService authService;
 
     public DeliveryService(ShipmentRepo shipmentRepo, DentureOrderRepo orderRepo, ToothItemRepo itemRepo,
                            TryInRecordRepo tryInRepo, OrderExceptionRepo exceptionRepo,
-                           ReworkRecordRepo reworkRepo, AuthService authService) {
+                           ReworkService reworkService, AuthService authService) {
         this.shipmentRepo = shipmentRepo;
         this.orderRepo = orderRepo;
         this.itemRepo = itemRepo;
         this.tryInRepo = tryInRepo;
         this.exceptionRepo = exceptionRepo;
-        this.reworkRepo = reworkRepo;
+        this.reworkService = reworkService;
         this.authService = authService;
     }
 
@@ -121,21 +121,17 @@ public class DeliveryService {
                                 + (delayReason == null ? "" : "，原因: " + delayReason));
             }
             case DAMAGED -> {
-                // 破损：本批次牙位返工，责任待判定
+                // 破损：本批次牙位建“待诊所确认”返工单，确认后才打回生产线
                 for (ToothItem item : items) {
-                    item.setStatus(ToothItemStatus.REWORKING);
-                    item.setCurrentStage(null);
+                    item.setStatus(ToothItemStatus.AWAIT_REWORK_CONFIRM);
                     item.setUpdatedAt(LocalDateTime.now());
                     itemRepo.save(item);
-                    ReworkRecord rework = new ReworkRecord();
-                    rework.setOrder(order);
-                    rework.setToothItem(item);
-                    rework.setReason("配送破损签收，需重新制作");
-                    reworkRepo.save(rework);
+                    reworkService.openRework(order, item, ReworkSource.DELIVERY_DAMAGE,
+                            "配送破损签收，需重新制作", null, null);
                 }
                 order.setStatus(OrderStatus.IN_PRODUCTION);
                 autoException(order, null, ExceptionType.DELIVERY_DAMAGE, user,
-                        "配送破损签收，已自动创建 " + items.size() + " 个牙位的返工单，责任待判定");
+                        "配送破损签收，已创建 " + items.size() + " 个牙位的待确认返工单，责任待判定");
             }
         }
         order.setUpdatedAt(LocalDateTime.now());

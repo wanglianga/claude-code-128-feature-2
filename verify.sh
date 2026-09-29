@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# 全流程验证脚本：下单→接单→八道工序→发货→签收→试戴→返工→重做→结算→月结
+# 全流程验证脚本：下单→接单→八道工序→发货→签收→试戴→不密合返工
+#   （诊所确认时限/是否收费→标记原因→判定责任→重做）→结算
+#   →月结（技工所同步→争议→诊所确认→财务确认）
 # 前提：服务已启动（默认 http://localhost:8080）
 set -euo pipefail
 
@@ -11,7 +13,7 @@ say()  { echo -e "\033[1;36m==>\033[0m $*"; }
 ok()   { PASS=$((PASS+1)); echo -e "  \033[1;32m✔\033[0m $*"; }
 bad()  { FAIL=$((FAIL+1)); echo -e "  \033[1;31m✘ $*\033[0m"; }
 check() { # check <描述> <实际值> <期望值>
-  if [ "$2" == "$3" ]; then ok "$1 ($2)"; else bad "$1: 期望[$3] 实际[$2]"; fi
+  if [ "$2" == "$3" ]; then ok "$1 ($2)"; else bad "$1: 期望[$3] 实际[$2]"; fi;
 }
 money() { awk -v v="$1" 'BEGIN{printf "%.2f", v}'; }
 checkMoney() { # checkMoney <描述> <实际值> <期望值>
@@ -32,6 +34,8 @@ login() { # login <用户名> <密码> -> token
 
 say "0. 健康检查与登录"
 check "健康检查" "$(req GET /api/health | jq -r '.status')" "UP"
+check "OpenAPI 文档可访问" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v3/api-docs")" "200"
+check "Swagger UI 可访问" "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/swagger-ui/index.html")" "200"
 DOCTOR=$(login doctor1 doctor123)
 RECEIVER=$(login receiver lab123)
 TECH1=$(login tech1 tech123)
@@ -60,8 +64,8 @@ echo "  订单号: $ONO (id=$OID, 牙位项=$ITEM1,$ITEM2)"
 req POST "/api/orders/$OID/scan-files" "$DOCTOR" '{"fileName":"pat001.stl","format":"STL","sizeBytes":1048576,"storagePath":"oss://scans/pat001.stl"}' > /dev/null
 check "口扫文件登记" "$(req GET "/api/orders/$OID" "$DOCTOR" | jq -r '.data.scanFiles | length')" "1"
 
-say "2. 技工所接单并推进八道工序"
-req POST "/api/orders/$OID/accept" "$RECEIVER" > /dev/null
+say "2. 技工所接单并推进八道工序（扫描设计自动生成设计版本 v1）"
+req POST /api/orders/$OID/accept "$RECEIVER" > /dev/null
 check "接单后状态" "$(req GET "/api/orders/$OID" "$RECEIVER" | jq -r '.data.status')" "ACCEPTED"
 
 ZIRC_BATCH=$(req GET /api/inventory/materials "$LADMIN" | jq -r '.data[] | select(.code=="ZIRC") | .batches[0].id')
@@ -81,6 +85,7 @@ for ITEM in $ITEM1 $ITEM2; do
   stage "$ITEM" "$RECEIVER" DELIVERY ',"note":"已打包"'
 done
 check "全部工序完成订单状态" "$(req GET "/api/orders/$OID" "$RECEIVER" | jq -r '.data.status')" "QC_PASSED"
+check "牙位12设计版本v1" "$(req GET "/api/orders/$OID/tooth-board" "$LADMIN" | jq -r '[.data.teeth[] | select(.toothPosition=="12") | .designVersions | length][0]')" "1"
 STOCK_AFTER=$(req GET /api/inventory/materials "$LADMIN" | jq -r '.data[] | select(.code=="ZIRC") | .remainingQty')
 check "材料库存扣减(200-2)" "$(money "$STOCK_AFTER")" "$(money "$(awk -v a="$STOCK_BEFORE" 'BEGIN{print a-2}')")"
 
@@ -96,17 +101,26 @@ req POST "/api/shipments/$SHIP_ID/sign" "$CADMIN" '{"signResult":"GOOD","signedB
 check "签收后订单状态" "$(req GET "/api/orders/$OID" "$DOCTOR" | jq -r '.data.status')" "TRY_IN"
 check "试戴安排生成" "$(req GET "/api/orders/$OID/try-ins" "$DOCTOR" | jq -r '.data | length')" "2"
 
-say "5. 牙位11试戴密合，牙位12不密合 → 自动异常+自动返工"
+say "5. 牙位11密合，牙位12边缘不密合 → 待诊所确认返工（关联设计版本/医生备注/技工操作/照片）"
 req POST "/api/orders/$OID/try-ins" "$DOCTOR" "{\"toothItemId\":$ITEM1,\"result\":\"FIT\",\"feedback\":\"密合良好\",\"experienceScore\":5}" > /dev/null
-req POST "/api/orders/$OID/try-ins" "$DOCTOR" "{\"toothItemId\":$ITEM2,\"result\":\"MISFIT\",\"feedback\":\"边缘不密合\",\"experienceScore\":2}" > /dev/null
+req POST "/api/orders/$OID/try-ins" "$DOCTOR" "{\"toothItemId\":$ITEM2,\"result\":\"MISFIT\",\"misfitType\":\"EDGE_MISFIT\",\"doctorNotes\":\"边缘缝隙食物嵌塞\",\"photos\":[\"tryin_12.jpg\"],\"experienceScore\":2}" > /dev/null
 check "不密合自动登记异常" "$(req GET "/api/orders/$OID/exceptions" "$DOCTOR" | jq -r '[.data[] | select(.type=="TRY_IN_MISFIT")] | length')" "1"
 REWORK_ID=$(req GET "/api/orders/$OID/reworks" "$DOCTOR" | jq -r '.data[0].id')
-check "自动创建返工单" "$(req GET "/api/orders/$OID/reworks" "$DOCTOR" | jq -r '.data | length')" "1"
+check "返工单初始状态" "$(req GET "/api/reworks/$REWORK_ID" "$DOCTOR" | jq -r '.data.status')" "AWAIT_CONFIRM"
+check "返工问题分类" "$(req GET "/api/reworks/$REWORK_ID" "$DOCTOR" | jq -r '.data.misfitType')" "EDGE_MISFIT"
+check "返工关联设计版本" "$(req GET "/api/reworks/$REWORK_ID" "$DOCTOR" | jq -r '.data.designVersionId != null')" "true"
+check "返工留痕技工操作" "$(req GET "/api/reworks/$REWORK_ID" "$DOCTOR" | jq -r '.data.technicianOps != null and (.data.technicianOps | length > 0)')" "true"
+check "待诊所确认列表" "$(req GET /api/reworks/awaiting-confirm "$CADMIN" | jq -r '[.data[] | select(.id=='$REWORK_ID')] | length')" "1"
 
-say "6. 订单未完成时结算被拦截"
+say "6. 未确认返工时：订单不能结算、牙位不能重做"
 check "结算拦截(订单未完成)" "$(req POST "/api/orders/$OID/settlement" "$FINANCE" '' | jq -r '.success')" "false"
+check "重做拦截(待诊所确认)" "$(req POST "/api/orders/$OID/items/$ITEM2/stages" "$RECEIVER" '{"stage":"MODEL_RECEIVING","finish":true}' | jq -r '.error' | grep -c '诊所确认')" "1"
 
-say "7. 牙位12返工重做 → 重发 → 试戴密合"
+say "7. 诊所确认返工（72小时时限/免费返修）→ 重做 → 重发 → 试戴密合"
+check "缺是否收费确认被拒" "$(req POST "/api/reworks/$REWORK_ID/clinic-confirm" "$CADMIN" '{"deadlineHours":72}' | jq -r '.success')" "false"
+req POST "/api/reworks/$REWORK_ID/clinic-confirm" "$CADMIN" '{"deadlineHours":72,"chargeable":false,"confirmNote":"边缘重做"}' > /dev/null
+check "返工单已确认" "$(req GET "/api/reworks/$REWORK_ID" "$DOCTOR" | jq -r '.data.status')" "CONFIRMED"
+check "返工不收费" "$(req GET "/api/reworks/$REWORK_ID" "$DOCTOR" | jq -r '.data.chargeable')" "false"
 req POST "/api/orders/$OID/exceptions" "$SERVICE" "{\"type\":\"REWORK_DISPUTE\",\"description\":\"责任分歧\",\"toothItemId\":$ITEM2}" > /dev/null
 for S in MODEL_RECEIVING SCAN_DESIGN; do stage "$ITEM2" "$TECH1" "$S" ''; done
 req POST "/api/orders/$OID/items/$ITEM2/confirm" "$DOCTOR" > /dev/null
@@ -116,33 +130,51 @@ stage "$ITEM2" "$TECH1" POLISHING ''
 stage "$ITEM2" "$QC" QC ''
 stage "$ITEM2" "$RECEIVER" DELIVERY ''
 check "返工单自动完成" "$(req GET "/api/orders/$OID/reworks" "$DOCTOR" | jq -r '.data[0].status')" "COMPLETED"
+check "重做产生设计版本v2" "$(req GET "/api/orders/$OID/tooth-board" "$LADMIN" | jq -r '[.data.teeth[] | select(.toothPosition=="12") | .designVersions | length][0]')" "2"
 SHIP2=$(req POST "/api/orders/$OID/shipments" "$RECEIVER" "{\"itemIds\":[$ITEM2]}")
 SHIP2_ID=$(echo "$SHIP2" | jq -r '.data.id')
 req POST "/api/shipments/$SHIP2_ID/sign" "$CADMIN" '{"signResult":"GOOD","signedByName":"陈前台"}' > /dev/null
 req POST "/api/orders/$OID/try-ins" "$DOCTOR" "{\"toothItemId\":$ITEM2,\"result\":\"FIT\",\"experienceScore\":4}" > /dev/null
 check "订单完成" "$(req GET "/api/orders/$OID" "$DOCTOR" | jq -r '.data.status')" "COMPLETED"
 
-say "8. 返工责任未判定 → 结算拦截；判定责任（技工所承担200）→ 财务结算"
+say "8. 未标记原因/责任 → 结算拦截；标记加工问题+技工所责任200 → 结算"
 check "结算拦截(返工责任不清)" "$(req POST "/api/orders/$OID/settlement" "$FINANCE" '' | jq -r '.error' | grep -c '返工责任')" "1"
+check "未标记原因不能判责任" "$(req POST "/api/reworks/$REWORK_ID/assign-responsibility" "$LADMIN" '{"responsibility":"LAB","reworkCost":200}' | jq -r '.success')" "false"
+req POST "/api/reworks/$REWORK_ID/mark-cause" "$LADMIN" '{"cause":"PROCESSING","causeNote":"烧结收缩控制不当"}' > /dev/null
+check "返工原因三分类" "$(req GET "/api/reworks/$REWORK_ID" "$DOCTOR" | jq -r '.data.cause')" "PROCESSING"
 req POST "/api/reworks/$REWORK_ID/assign-responsibility" "$LADMIN" '{"responsibility":"LAB","reworkCost":200}' > /dev/null
 SETTLE=$(req POST "/api/orders/$OID/settlement" "$FINANCE" '')
 checkMoney "基础费(500×2)" "$(echo "$SETTLE" | jq -r '.data.baseAmount')" "1000"
 checkMoney "难度系数" "$(echo "$SETTLE" | jq -r '.data.difficultyMultiplier')" "1.30"
 checkMoney "技工所承担返工扣减" "$(echo "$SETTLE" | jq -r '.data.reworkLabDeduction')" "200"
 checkMoney "应付总额(1300-200)" "$(echo "$SETTLE" | jq -r '.data.totalAmount')" "1100"
+check "结算明细含责任调整" "$(echo "$SETTLE" | jq -r '.data.detail | contains("返工责任调整")')" "true"
 
-say "9. 月结：未复核返工 → 确认被拒；复核后确认成功"
+say "9. 月结：生成→技工所同步→争议→复核→诊所确认→财务确认"
 YM=$(date +%Y-%m)
 STMT=$(req POST /api/statements/generate "$FINANCE" "{\"clinicId\":1,\"yearMonth\":\"$YM\"}")
 STMT_ID=$(echo "$STMT" | jq -r '.data.id')
-check "月结单含未复核返工" "$(echo "$STMT" | jq -r '.data.unreviewedReworkCount')" "1"
-check "未复核时确认被拒" "$(req POST "/api/statements/$STMT_ID/confirm" "$CADMIN" '' | jq -r '.error' | grep -c '复核')" "1"
+check "月结单初始状态" "$(echo "$STMT" | jq -r '.data.status')" "GENERATED"
+check "月结返工技工所扣减合计" "$(echo "$STMT" | jq -r '.data.reworkLabDeduction')" "200"
+check "技工所未同步不能确认" "$(req POST "/api/statements/$STMT_ID/confirm" "$CADMIN" '' | jq -r '.error' | grep -c '同步')" "1"
+check "同步前诊所列表不可见" "$(req GET /api/statements "$CADMIN" | jq -r '[.data[] | select(.id=='$STMT_ID')] | length')" "0"
+req POST "/api/statements/$STMT_ID/lab-sync" "$LADMIN" > /dev/null
+check "技工所同步后状态" "$(req GET "/api/statements/$STMT_ID" "$LADMIN" | jq -r '.data.status')" "LAB_SYNCED"
+check "未复核时诊所确认被拒" "$(req POST "/api/statements/$STMT_ID/confirm" "$CADMIN" '' | jq -r '.error' | grep -c '复核')" "1"
+DISPUTE_ID=$(req POST "/api/statements/$STMT_ID/disputes" "$CADMIN" '{"description":"返工扣减200需核对凭证"}' | jq -r '.data.id')
+check "争议提出方" "$(req GET "/api/statements/$STMT_ID/disputes" "$CADMIN" | jq -r '.data[0].raisedSide')" "CLINIC"
 req POST "/api/reworks/$REWORK_ID/clinic-review" "$CADMIN" > /dev/null
-check "复核后月结确认" "$(req POST "/api/statements/$STMT_ID/confirm" "$CADMIN" '' | jq -r '.data.status')" "CONFIRMED"
+req POST "/api/statements/$STMT_ID/confirm" "$CADMIN" > /dev/null
+check "诊所确认后状态" "$(req GET "/api/statements/$STMT_ID" "$LADMIN" | jq -r '.data.status')" "CLINIC_CONFIRMED"
+check "有未决争议财务确认被拒" "$(req POST "/api/statements/$STMT_ID/finance-confirm" "$FINANCE" '' | jq -r '.error' | grep -c '争议')" "1"
+req POST "/api/statements/disputes/$DISPUTE_ID/resolve" "$LADMIN" '{"resolution":"已提供质检凭证，双方认可"}' > /dev/null
+req POST "/api/statements/$STMT_ID/finance-confirm" "$FINANCE" > /dev/null
+check "财务端最终确认" "$(req GET "/api/statements/$STMT_ID" "$FINANCE" | jq -r '.data.status')" "FINANCE_CONFIRMED"
+check "月结详情返工原因" "$(req GET "/api/statements/$STMT_ID" "$FINANCE" | jq -r '.data.reworks[0].cause')" "PROCESSING"
 
 say "10. 按牙位看板 / 技工绩效 / 加急+延误场景"
 check "牙位12看板含返工责任" "$(req GET "/api/orders/$OID/tooth-board" "$LADMIN" | jq -r '[.data.teeth[] | select(.toothPosition=="12") | .reworks[0].responsibility][0]')" "LAB"
-check "技工绩效有工序记录" "$(req GET /api/performance/technicians "$LADMIN" | jq -r '[.data[] | select(.technicianName=="张技工") | .stagesCompleted][0] > 0')" "true"
+check "技工绩效有工序记录" "$(req GET "/api/performance/technicians" "$LADMIN" | jq -r '[.data[] | select(.technicianName=="张技工") | .stagesCompleted][0] > 0')" "true"
 
 ORDER2=$(req POST /api/orders "$DOCTOR" '{"patientCode":"PAT-VERIFY-002","prosthesisType":"PFM_CROWN","impressionMethod":"TRADITIONAL","toothPositions":["36"],"shade":"VITA B1","expectedTryInDate":"2026-10-05","difficulty":1}')
 OID2=$(echo "$ORDER2" | jq -r '.data.id')

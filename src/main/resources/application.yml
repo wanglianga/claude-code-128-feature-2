@@ -20,5 +20,12 @@ spring:
   jackson:
     time-zone: Asia/Shanghai
 
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+
 app:
   token-ttl-hours: 12

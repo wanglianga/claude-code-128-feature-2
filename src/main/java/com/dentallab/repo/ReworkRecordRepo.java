@@ -12,5 +12,7 @@ public interface ReworkRecordRepo extends JpaRepository<ReworkRecord, Long> {
 
     List<ReworkRecord> findByToothItemIdAndStatus(Long toothItemId, ReworkStatus status);
 
+    List<ReworkRecord> findByToothItemIdAndStatusIn(Long toothItemId, Collection<ReworkStatus> statuses);
+
     List<ReworkRecord> findByOrderIdIn(Collection<Long> orderIds);
 }
